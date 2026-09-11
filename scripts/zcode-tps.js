@@ -1,6 +1,6 @@
 /**
- * ZCode TPS Footer v1.2.0 —— 输入框工具栏统计胶囊（无常驻服务，多窗格独立渲染）
- * 每个会话窗格最近一轮: ● 时间 · 首 token Xs · X tok/s · out X（生成中实时刷新）
+ * ZCode TPS Footer v1.2.1 —— 输入框工具栏统计胶囊（无常驻服务，多窗格独立渲染）
+ * 每个会话窗格最近一轮: ● 首 token Xs · X tok/s · out X（生成中实时刷新）
  *
  * 数据源: 页面内 MessagePort 会话事件流（preload 转交的 zcode:service-port）
  *   - conversation 行事件: turnHeader / userInput / reasoning / assistantText / row.delta(文本增量)
@@ -10,6 +10,13 @@
  *     usage.delta 到达后用精确值覆盖。轮结束后为精确值(精确 out ÷ 首块→末次 usage 解码窗口)。
  *   - 工具执行等静默期速度保持最近值；点停止/出错未报 usage 时 out 以内容估算兜底；
  *     同一 turnId 复用(编辑重发/重试)时自动清零旧统计。
+ *
+ * v1.2.1:
+ *   - 删除轮次时间段（用户反馈聊天框空间不足；时间最不重要）
+ *   - 修复溢出截断：v1.2.0 的量宽探针挂载段时未插分隔符，比实际渲染窄 ~28px，
+ *     导致胶囊宽度被低估、内容被 overflow:hidden 裁剪。现探针与胶囊共用 mountSegs()
+ *     （含 · 分隔符与 flex gap），量宽与渲染永不背离
+ *   - 降级顺序简化：宽度不足先丢 out、再丢首 token，tok/s 永不丢
  *
  * v1.2.0:
  *   - 段优先级（高→低）: tok/s > 首 token > out > 时间。宽度不足按 时间→out→首 token 丢弃，
@@ -302,8 +309,8 @@
   const ACCENT = "var(--color-warning, #e0983a)";
   const VALUE = "var(--color-foreground, #e8e8e8)";
 
-  // ---------- 段构建（显示顺序: 时间 · 首 token · tok/s · out；p 为优先级键） ----------
-  function buildSegs(s, full) {
+  // ---------- 段构建（显示顺序: 首 token · tok/s · out；p 为优先级键，tps 最高） ----------
+  function buildSegs(s) {
     const span = (txt, cls) => {
       const sp = document.createElement("span");
       sp.textContent = txt;
@@ -312,11 +319,31 @@
       return sp;
     };
     const segs = [];
-    if (s.stamp != null) segs.push({ p: 0, nodes: [span(s.stamp)] });
-    if (full && s.ttft != null && s.ttft >= 0) segs.push({ p: 1, nodes: [span("首 token "), span(fmtLat(s.ttft), "VALUE")] });
-    if (full && s.tps != null) segs.push({ p: 2, nodes: [span(fmtTps(s.tps) + " tok/s", "ACCENT")] });
-    if (full && s.out > 0) segs.push({ p: 3, nodes: [span("out "), span(fmtTok(s.out), "VALUE")] });
+    if (s.ttft != null && s.ttft >= 0) segs.push({ p: 1, nodes: [span("首 token "), span(fmtLat(s.ttft), "VALUE")] });
+    if (s.tps != null) segs.push({ p: 2, nodes: [span(fmtTps(s.tps) + " tok/s", "ACCENT")] });
+    if (s.out > 0) segs.push({ p: 3, nodes: [span("out "), span(fmtTok(s.out), "VALUE")] });
     return segs;
+  }
+
+  // 统一挂载：绿点 + 幸存段 + 段间 · 分隔符。探针量宽与胶囊渲染必须走同一函数——
+  // v1.2.0 的截断 bug 正是探针少挂了分隔符（差 ~28px），量宽低于实际渲染宽。
+  function mountSegs(container, segs, streaming) {
+    while (container.firstChild) container.removeChild(container.firstChild);
+    const dot = document.createElement("span");
+    dot.textContent = "●";
+    dot.style.color = "#4ade80";
+    if (streaming) dot.style.textShadow = "0 0 6px rgba(74,222,128,.8)";
+    container.appendChild(dot);
+    const alive = segs.filter((g) => !g._dropped);
+    alive.forEach((g, i) => {
+      if (i > 0) {
+        const sep = document.createElement("span");
+        sep.textContent = "·";
+        sep.style.opacity = "0.55";
+        container.appendChild(sep);
+      }
+      g.nodes.forEach((n) => container.appendChild(n));
+    });
   }
 
   // ---------- 渲染: 逐窗格悬浮统计胶囊 ----------
@@ -387,7 +414,7 @@
       if (t.sessionId && paneSess && t.sessionId !== paneSess) continue;   // 会话切换 DOM 中间态兜底
       if (!latest || (t.startedAt ?? 0) > (latest.startedAt ?? 0)) latest = t;
     }
-    if (!latest || (!hasActivity(latest) && latest.endedAt == null && latest.startedAt == null)) {
+    if (!latest || !hasActivity(latest)) {
       if (host) host.remove();
       return;
     }
@@ -398,7 +425,7 @@
     const s = statsOf(latest);
 
     // 数据与可用宽度均未变化：跳过量宽/重建，仅跟随定位（行/窗格可能移动）
-    const key = [s.stamp, s.ttft, s.tps, s.out, s.streaming, Math.round(allowed)].join("|");
+    const key = [s.ttft, s.tps, s.out, s.streaming, Math.round(allowed)].join("|");
     if (host && host._zkey === key) {
       positionHost(host, gap, rr, allowed);
       positionTip(host);
@@ -417,19 +444,18 @@
       fontSize: "11px", height: "22px", whiteSpace: "nowrap",
       fontVariantNumeric: "tabular-nums", padding: "0 10px",
     });
-    const dot = document.createElement("span");
-    dot.textContent = "●";
-    probe.appendChild(dot);
-    segs.forEach((g) => g.nodes.forEach((n) => probe.appendChild(n)));
     document.body.appendChild(probe);
     let fullW = 0;
     try {
+      mountSegs(probe, segs, s.streaming);
       fullW = probe.getBoundingClientRect().width;
-      for (const p of [0, 3, 1]) {
+      // 优先级 tps > 首 token > out：先丢 out(3)、再丢首 token(1)，tok/s(2) 永不丢
+      for (const p of [3, 1]) {
         if (fullW <= allowed) break;
-        const g = segs.find((x) => x.p === p);
+        const g = segs.find((x) => x.p === p && !x._dropped);
         if (!g) continue;
-        g.nodes.forEach((n) => n.remove());
+        g._dropped = true;
+        mountSegs(probe, segs, s.streaming);
         fullW = probe.getBoundingClientRect().width;
       }
     } finally {
@@ -439,7 +465,7 @@
       if (host) host.remove();
       return;
     }
-    const dropped = segs.filter((x) => x.nodes[0].parentNode == null).map((x) => x.p);
+    const dropped = segs.filter((x) => x._dropped).map((x) => x.p);
 
     if (!host) {
       host = document.createElement("div");
@@ -466,22 +492,7 @@
     host._zkey = key;
     host._zw = fullW;
     host.innerHTML = "";
-    const dot2 = document.createElement("span");
-    dot2.textContent = "●";
-    dot2.style.color = "#4ade80";
-    if (s.streaming) dot2.style.textShadow = "0 0 6px rgba(74,222,128,.8)";
-    host.appendChild(dot2);
-    // 只挂载幸存段（探针中已摘除的段 parentNode 为 null），段间插分隔符
-    const alive = segs.filter((g) => g.nodes[0].parentNode != null);
-    alive.forEach((g, i) => {
-      if (i > 0) {
-        const sep = document.createElement("span");
-        sep.textContent = "·";
-        sep.style.opacity = "0.55";
-        host.appendChild(sep);
-      }
-      g.nodes.forEach((n) => host.appendChild(n));
-    });
+    mountSegs(host, segs, s.streaming);
     positionHost(host, gap, rr, allowed);
     positionTip(host);
     liveKeys.add(paneKey);
@@ -518,20 +529,7 @@
         color: "var(--color-foreground-subtle, #9a9a9a)",
         pointerEvents: "none",
       });
-      const dot = document.createElement("span");
-      dot.textContent = "●";
-      dot.style.color = "#4ade80";
-      if (host._zstats.streaming) dot.style.textShadow = "0 0 6px rgba(74,222,128,.8)";
-      tip.appendChild(dot);
-      buildSegs(host._zstats, true).forEach((g, i) => {
-        if (i > 0) {
-          const sep = document.createElement("span");
-          sep.textContent = "·";
-          sep.style.opacity = "0.55";
-          tip.appendChild(sep);
-        }
-        g.nodes.forEach((n) => tip.appendChild(n));
-      });
+      mountSegs(tip, buildSegs(host._zstats), host._zstats.streaming);
       document.body.appendChild(tip);
       positionTip(host);
     } catch (err) { /* 静默 */ }
