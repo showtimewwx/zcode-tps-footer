@@ -1,5 +1,5 @@
 /**
- * ZCode TPS Footer v2.0.0 —— 输入框工具栏统计胶囊（无常驻服务，多窗格独立渲染，事件驱动）
+ * ZCode TPS Footer v2.0.1 —— 输入框工具栏统计胶囊（无常驻服务，多窗格独立渲染，事件驱动）
  * 每个会话窗格最近一轮: ● 首 token Xs · X tok/s · out X（生成中实时刷新）
  *
  * 数据源: 页面内 MessagePort 会话事件流（preload 转交的 zcode:service-port）
@@ -10,6 +10,26 @@
  *     usage.delta 到达后用精确值覆盖。轮结束后为精确值(精确 out ÷ 首块→末次 usage 解码窗口)。
  *   - 工具执行等静默期速度保持最近值；点停止/出错未报 usage 时 out 以内容估算兜底；
  *     同一 turnId 复用(编辑重发/重试)时自动清零旧统计。
+ *
+ * v2.0.1 修复两处实测 bug：
+ *   - 多会话并行 out 串轮（审计发现 mtx38252 轮多计 17125）：
+ *     帧流跨会话/跨窗口共享（实测同端口流经 3 个会话的帧），usage.delta 的
+ *     sourceCommandId 关联失败时走 scidTurn 全局兜底，该映射可被其它会话的
+ *     stream.chunk 污染 → 别的会话的 usage 被累加进当前轮。修复：①usage.delta
+ *     仅按 scid 精确命中，未命中丢弃，不再盲目兜底；②命中后校验帧 sessionId
+ *     与轮 sessionId，不一致丢弃；③stream.chunk 改走 assistantMessageId 中转。
+ *   - v2.0.0 渲染死锁：页面后台时 rAF 不触发，schedPending 永不复位，
+ *     切回前台后渲染管线永久冻结（胶囊停在旧快照）。修复：rAF+setTimeout
+ *     双通道调度，后台 setTimeout 兜底（节流 ~1s 仍触发）。
+ *   - 根因：MessagePort 帧流跨会话/跨窗口共享（实测同端口流经 3 个会话的帧），
+ *     usage.delta 的 sourceCommandId 关联失败时走 scidTurn 全局兜底，
+ *     该映射可被其它会话的 stream.chunk 污染 → 别的会话的 usage 被累加进当前轮。
+ *   - 修复：①usage.delta 仅按 scid 精确命中（findByScid），未命中直接丢弃，
+ *     不再走 scidTurn 盲目兜底；②命中后校验帧 sessionId 与轮 sessionId，
+ *     不一致丢弃（防同会话不同轮/跨会话串扰）；③stream.chunk 改走
+ *     assistantMessageId 中转（respTurn 来自行事件，可信）。帧自带 turnId/sessionId 实测稳定绑定
+ *     （scid↔turnId↔sessionId 三元组 2041 帧恒定），但 msgId 映射需行事件桥梁，
+ *     故以 scid+sessionId 双重过滤实现同等隔离。
  *
  * v2.0.0 渲染层事件化（替代全树扫描轮询）:
  *   - 窗格注册表：MutationObserver 只负责「窗格发现」（composer 卡片增删），不再触发渲染
@@ -59,7 +79,6 @@
   const firstChunkByScid = {};
   const rowTurn = new Map();        // rowId -> turnId（row.delta 增量归属）
   const respTurn = new Map();       // assistantResponseId -> turnId（stream.chunk 的 assistantMessageId 归属）
-  const scidTurn = new Map();       // sourceCommandId -> turnId（usage.delta 关联兜底）
 
   const get = (id) => {
     if (!turns.has(id)) turns.set(id, {
@@ -137,8 +156,11 @@
     const scid = ev.sourceCommandId;
     if (ev.kind === "usage.delta") {
       if (!scid) return;
-      const t = findByScid(scid) || turns.get(scidTurn.get(scid));
+      // 仅按 scid 精确命中；不再走 scidTurn 盲目兜底（跨会话污染源，见 v2.0.1 说明）
+      const t = findByScid(scid);
       if (!t) return;
+      // 会话校验：帧的 sessionId 与轮已知 sessionId 不一致 → 跨会话/跨轮串扰，丢弃
+      if (t.sessionId && ev.sessionId && t.sessionId !== ev.sessionId) return;
       t.outputTokens += ev.outputTokens || 0;
       t.inputTokens += ev.inputTokens || 0;
       t.cacheReadTokens += ev.cacheReadTokens || 0;
@@ -152,13 +174,16 @@
       scan();
     } else if (ev.kind === "stream.chunk") {
       if (firstChunkByScid[scid] == null) firstChunkByScid[scid] = ev.occurredAt;
+      // scid 精确命中优先；assistantMessageId 中转次之（respTurn 来自行事件，可信）；
+      // 不再走 scidTurn 盲目兜底（v2.0.1：跨会话污染源）
       let t = findByScid(scid);
       if (!t && ev.assistantMessageId) {
         const tid = respTurn.get(ev.assistantMessageId);
-        if (tid) { t = turns.get(tid); if (t && scid) scidTurn.set(scid, tid); }
+        if (tid) t = turns.get(tid);
       }
-      if (!t && scid && scidTurn.has(scid)) t = turns.get(scidTurn.get(scid));
       if (!t) return;
+      // 会话校验：不一致丢弃（帧流跨会话共享，见 v2.0.1 说明）
+      if (t.sessionId && ev.sessionId && t.sessionId !== ev.sessionId) return;
       if (t.firstChunkAt == null) t.firstChunkAt = firstChunkByScid[scid];
       t.sessionId = ev.sessionId || t.sessionId;
       t.streaming = true;   // turnHeader 未到时也标记生成中
@@ -599,19 +624,26 @@
   let schedKind = 0;   // 0 无 | 1 pos | 2 full（pos 可被 full 升级，反之不可）
   let schedPending = false;
 
+  function fireSched() {
+    if (!schedPending) return;
+    schedPending = false;
+    const kind = schedKind;
+    schedKind = 0;
+    try {
+      renderAll(kind === 1);
+      if (kind === 2) removeLegacyFooters();
+    } catch (err) { /* 静默 */ }
+  }
+
+  // 双通道：rAF 前台合帧（与浏览器渲染同步）；setTimeout 兜底——
+  // 页面后台时 rAF 不触发，若只有 rAF，schedPending 永不复位 → 渲染管线死锁
+  //（实测：切后台再回来，胶囊冻结在旧快照）。setTimeout 后台被节流到 ~1s，足够。
   function schedule(kind) {
     if (kind === 2 || schedKind === 0) schedKind = Math.max(schedKind, kind);
     if (schedPending) return;
     schedPending = true;
-    requestAnimationFrame(() => {
-      schedPending = false;
-      const kind = schedKind;
-      schedKind = 0;
-      try {
-        renderAll(kind === 1);
-        if (kind === 2) removeLegacyFooters();
-      } catch (err) { /* 静默 */ }
-    });
+    requestAnimationFrame(fireSched);
+    setTimeout(fireSched, 250);
   }
 
   function scan() { schedule(2); }   // 数据变化：全量
